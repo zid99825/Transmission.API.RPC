@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Net;
 using System.Text;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
@@ -9,6 +8,8 @@ using Transmission.API.RPC.Entity;
 using Newtonsoft.Json.Linq;
 using Transmission.API.RPC.Common;
 using Transmission.API.RPC.Arguments;
+using System.Net.Http;
+using System.Net;
 
 namespace Transmission.API.RPC
 {
@@ -427,65 +428,61 @@ namespace Transmission.API.RPC
         private TransmissionResponse SendRequest(TransmissionRequest request)
         {
             TransmissionResponse result = new TransmissionResponse();
+            var task = SendRequestTask(request);
+            task.WaitAndUnwrapException();
+            result = task.Result;
+            return result;
+        }
+
+        private async Task<TransmissionResponse> SendRequestTask(TransmissionRequest request)
+        {
+
+            TransmissionResponse result = new TransmissionResponse();
 
             request.Tag = ++CurrentTag;
 
-            try
+            using (HttpClient client = new HttpClient())
             {
-
-                byte[] byteArray = Encoding.UTF8.GetBytes(request.ToJson());
-
-                //Prepare http web request
-                HttpWebRequest webRequest = (HttpWebRequest)WebRequest.Create(Url);
-
-                webRequest.ContentType = "application/json-rpc";
-                webRequest.Headers["X-Transmission-Session-Id"] = SessionID;
-                webRequest.Method = "POST";
-
+                client.DefaultRequestHeaders.Add("X-Transmission-Session-Id", SessionID);
                 if (_needAuthorization)
-                    webRequest.Headers["Authorization"] = _authorization;
-
-                var requestTask = webRequest.GetRequestStreamAsync();
-                requestTask.WaitAndUnwrapException();
-                using (Stream dataStream = requestTask.Result)
                 {
-                    dataStream.Write(byteArray, 0, byteArray.Length);
+                    client.DefaultRequestHeaders.Add("Authorization", _authorization);
                 }
 
-                var responseTask = webRequest.GetResponseAsync();
-                responseTask.WaitAndUnwrapException();
+                
 
-                //Send request and prepare response
-                using (var webResponse = responseTask.Result)
+                var content = new StringContent(request.ToJson(), Encoding.UTF8, "application/json-rpc");
+
+                try
                 {
-                    using (Stream responseStream = webResponse.GetResponseStream())
+                    var httpResponseMessage = await client.PostAsync(new Uri(Url), content);
+                    if (httpResponseMessage.IsSuccessStatusCode)
                     {
-                        var reader = new StreamReader(responseStream, Encoding.UTF8);
-                        var responseString = reader.ReadToEnd();
+                        var responseString = await httpResponseMessage.Content.ReadAsStringAsync();
                         result = JsonConvert.DeserializeObject<TransmissionResponse>(responseString);
-
-                        if (result.Result != "success")
-                            throw new Exception(result.Result);
                     }
-                }
-            }
-            catch (WebException ex)
-            {
-                if (((HttpWebResponse)ex.Response).StatusCode == HttpStatusCode.Conflict)
-                {
-                    if (ex.Response.Headers.Count > 0)
+                    else if (httpResponseMessage.StatusCode == HttpStatusCode.Conflict)
                     {
-                        //If session id expiried, try get session id and send request
-                        SessionID = ex.Response.Headers["X-Transmission-Session-Id"];
 
-                        if (SessionID == null)
+                        if (httpResponseMessage.Headers != null && httpResponseMessage.Headers.TryGetValues("X-Transmission-Session-Id", out var values))
+                        {
+                            var enumerator = values.GetEnumerator();
+                            if (enumerator.MoveNext())
+                            {
+                                SessionID = enumerator.Current;
+                            }
+                            result = await SendRequestTask(request);
+                        }
+                        else
+                        {
                             throw new Exception("Session ID Error");
-
-                        result = SendRequest(request);
+                        }
                     }
                 }
-                else
-                    throw ex;
+                catch (Exception ex)
+                {
+                    Console.WriteLine();
+                }
             }
 
             return result;
